@@ -2,10 +2,9 @@
 
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { 
   Play, 
-  Bell, 
   Search, 
   Plus, 
   MoreHorizontal, 
@@ -17,15 +16,9 @@ import {
   ListTodo, 
   Settings, 
   FileText, 
-  Share2, 
-  Database,
-  ArrowRight,
+  Share2,
   Sparkles,
   Globe,
-  Cpu,
-  Lock,
-  Zap,
-  BarChart2,
   Cpu as CpuIcon
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -96,7 +89,6 @@ function useTypewriter(words: string[], speed: number = 80, delay: number = 1800
 }
 
 export default function LandingPage() {
-  const [billingPeriod, setBillingPeriod] = useState<'monthly' | 'yearly'>('monthly');
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const dynamicWord = useTypewriter([
@@ -137,7 +129,6 @@ export default function LandingPage() {
         <nav className="hidden md:flex items-center space-x-8 text-sm font-medium text-muted-foreground">
           <Link href="#features" className="hover:text-foreground transition-colors">Features</Link>
           <Link href="#how-it-works" className="hover:text-foreground transition-colors">How It Works</Link>
-          <Link href="#pricing" className="hover:text-foreground transition-colors">Pricing</Link>
           <Link href="/dashboard" className="hover:text-foreground transition-colors">Dashboard</Link>
         </nav>
 
@@ -691,7 +682,7 @@ export default function LandingPage() {
             <ul className="space-y-2 text-muted-foreground text-xs">
               <li><Link href="/dashboard" className="hover:text-foreground">RAG Explorer</Link></li>
               <li><Link href="#features" className="hover:text-foreground">Core Engine</Link></li>
-              <li><Link href="#pricing" className="hover:text-foreground">Pricing Tiers</Link></li>
+              <li><Link href="#how-it-works" className="hover:text-foreground">How It Works</Link></li>
             </ul>
           </div>
 

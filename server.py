@@ -153,12 +153,14 @@ def clean_pdf_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def extract_pdf_chunks(pdf_path: Path, doc_id: str, filename: str) -> List[Dict[str, Any]]:
+def extract_pdf_chunks(pdf_path: Path, doc_id: str, filename: str):
     """Extract page-by-page text chunks with exact page number and character positions."""
     chunks = []
+    total_pages = 0
     doc = fitz.open(pdf_path)
+    total_pages = len(doc)
     
-    for page_num in range(len(doc)):
+    for page_num in range(total_pages):
         page = doc[page_num]
         raw_text = page.get_text("text")
         text = clean_pdf_text(raw_text)
@@ -188,7 +190,7 @@ def extract_pdf_chunks(pdf_path: Path, doc_id: str, filename: str) -> List[Dict[
             start += chunk_size - overlap
             
     doc.close()
-    return chunks
+    return chunks, total_pages
 
 @app.get("/")
 def read_root():
@@ -211,8 +213,8 @@ async def upload_document(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(contents)
         
-    # Extract page chunks
-    chunks = extract_pdf_chunks(file_path, doc_id, file.filename)
+    # Extract page chunks (also returns total_pages to avoid reopening the file)
+    chunks, total_pages = extract_pdf_chunks(file_path, doc_id, file.filename)
     
     # Compute embeddings
     if chunks:
@@ -250,7 +252,7 @@ async def upload_document(file: UploadFile = File(...)):
         "size_bytes": len(contents),
         "upload_time": datetime_now_iso(),
         "total_chunks": len(chunks),
-        "total_pages": fitz.open(file_path).page_count
+        "total_pages": total_pages
     }
     documents_db[doc_id] = doc_meta
     chunks_db[doc_id] = chunks

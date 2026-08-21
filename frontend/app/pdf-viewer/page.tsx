@@ -35,6 +35,7 @@ function PdfViewerContent() {
   const [useIframeFallback, setUseIframeFallback] = useState<boolean>(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const renderTaskRef = useRef<any>(null);
 
   useEffect(() => {
     if (docId) {
@@ -60,9 +61,17 @@ function PdfViewerContent() {
     }
   }, [docId]);
 
-  // Render target page on canvas
+  // Render target page on canvas — cancel any in-progress render before starting a new one
   useEffect(() => {
     if (!pdfDoc || !canvasRef.current) return;
+
+    // Cancel any previous in-progress render task to avoid the
+    // "Cannot use the same canvas during multiple render() operations" error
+    if (renderTaskRef.current) {
+      renderTaskRef.current.cancel();
+      renderTaskRef.current = null;
+    }
+
     setLoadingPage(true);
 
     pdfDoc.getPage(page).then((pdfPage: any) => {
@@ -80,7 +89,11 @@ function PdfViewerContent() {
         viewport: viewport,
       };
 
-      pdfPage.render(renderContext).promise.then(async () => {
+      const renderTask = pdfPage.render(renderContext);
+      renderTaskRef.current = renderTask;
+
+      renderTask.promise.then(async () => {
+        renderTaskRef.current = null;
         // Draw visual text highlight overlay if snippet is provided
         if (snippet) {
           try {
@@ -184,11 +197,25 @@ function PdfViewerContent() {
           }
         }
         setLoadingPage(false);
+      }).catch((err: any) => {
+        // Ignore cancellation errors — they're expected when we cancel a render to start a new one
+        if (err?.name !== 'RenderingCancelledException') {
+          setLoadingPage(false);
+        }
       });
     }).catch(() => {
       setLoadingPage(false);
     });
+
+    // Cleanup: cancel render task if deps change or component unmounts
+    return () => {
+      if (renderTaskRef.current) {
+        renderTaskRef.current.cancel();
+        renderTaskRef.current = null;
+      }
+    };
   }, [pdfDoc, page, zoom, snippet]);
+
 
   if (!docId) {
     return (

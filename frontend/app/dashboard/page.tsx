@@ -231,18 +231,18 @@ export default function DashboardPage() {
         method: 'DELETE',
       });
       if (res.ok) {
-        setDocuments((prev) => prev.filter((d) => d.doc_id !== docId));
-        if (selectedDocId === docId) {
-          const remaining = documents.filter((d) => d.doc_id !== docId);
-          if (remaining.length > 0) {
-            setSelectedDocId(remaining[0].doc_id);
-          } else {
-            setSelectedDocId(null);
+        // Use functional updater so we work with the latest state, not a stale closure
+        setDocuments((prev) => {
+          const updated = prev.filter((d) => d.doc_id !== docId);
+          // If the deleted doc was selected, pick the next available one
+          if (selectedDocId === docId) {
+            setSelectedDocId(updated.length > 0 ? updated[0].doc_id : null);
           }
-        }
+          return updated;
+        });
         setIsSidebarOpen(false);
       } else {
-        alert('Failed to delete the document.');
+        alert('Failed to delete the document. Please try again.');
       }
     } catch (err) {
       console.error('Error deleting document:', err);
