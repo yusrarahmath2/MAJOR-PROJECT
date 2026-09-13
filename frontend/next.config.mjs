@@ -2,9 +2,9 @@
 const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
+  transpilePackages: ['react-markdown', 'remark-gfm', 'rehype-raw'],
   webpack: (config) => {
     config.resolve.alias.canvas = false;
-    config.cache = false;
     return config;
   },
 };

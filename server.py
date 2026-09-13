@@ -21,6 +21,62 @@ from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 import requests
 
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_AVAILABLE = True
+    print("BM25Okapi lexical retrieval engine loaded successfully.")
+except ImportError:
+    BM25_AVAILABLE = False
+    print("Warning: rank-bm25 not installed. Operating in dense vector fallback mode.")
+
+try:
+    import langdetect
+    LANGDETECT_AVAILABLE = True
+    print("langdetect library loaded successfully.")
+except ImportError:
+    LANGDETECT_AVAILABLE = False
+    print("Warning: langdetect not installed. Language detection fallback active.")
+
+LANGUAGE_NAMES = {
+    'hi': 'Hindi (हिन्दी)',
+    'en': 'English',
+    'fr': 'French (Français)',
+    'es': 'Spanish (Español)',
+    'de': 'German (Deutsch)',
+    'zh-cn': 'Chinese (Simplified)',
+    'zh-tw': 'Chinese (Traditional)',
+    'ja': 'Japanese (日本語)',
+    'bn': 'Bengali (বাংলা)',
+    'ta': 'Tamil (தமிழ்)',
+    'te': 'Telugu (తెలుగు)',
+    'mr': 'Marathi (मराठी)',
+    'gu': 'Gujarati (ગુજરાતી)',
+    'kn': 'Kannada (ಕನ್ನಡ)',
+    'ml': 'Malayalam (മലയാളം)',
+    'pa': 'Punjabi (ਪੰਜਾਬੀ)',
+    'ur': 'Urdu (اردو)',
+    'ar': 'Arabic (العربية)',
+    'ru': 'Russian (Русский)',
+    'it': 'Italian (Italiano)',
+    'pt': 'Portuguese (Português)',
+    'ko': 'Korean (한국어)',
+    'nl': 'Dutch (Nederlands)'
+}
+
+def detect_language_with_name(text: str) -> tuple[str, str]:
+    """Detects ISO language code and human-readable name from text sample."""
+    if not text or not LANGDETECT_AVAILABLE:
+        return 'en', 'English'
+    sample = text[:1000].strip()
+    if len(sample) < 15:
+        return 'en', 'English'
+    try:
+        code = langdetect.detect(sample)
+        name = LANGUAGE_NAMES.get(code, code.upper())
+        return code, name
+    except Exception:
+        return 'en', 'English'
+
 # Load Environment Variables
 load_dotenv()
 
@@ -135,11 +191,30 @@ if OPENROUTER_API_KEY:
 class ChatRequest(BaseModel):
     query: str
     doc_id: Optional[str] = None
+    target_language: Optional[str] = "auto"
     research_mode: bool = False
     chat_history: Optional[List[Dict[str, str]]] = []
 
 class ResearchRequest(BaseModel):
     query: str
+
+class SearchRequest(BaseModel):
+    query: str
+    doc_id: Optional[str] = None
+    top_k: int = 5
+    mode: str = "hybrid"  # "hybrid", "dense", or "bm25"
+
+class CompareRequest(BaseModel):
+    doc_id_1: str
+    doc_id_2: str
+    target_language: Optional[str] = "auto"
+    focus_area: Optional[str] = None
+
+def tokenize_for_bm25(text: str) -> List[str]:
+    """Tokenize string into lowercase alphanumeric words/tokens for lexical BM25 matching."""
+    if not text:
+        return []
+    return re.findall(r"\w+", text.lower())
 
 def clean_pdf_text(text: str) -> str:
     """Clean raw PDF text by removing model tokens, control chars, and redundant whitespace."""
@@ -245,6 +320,10 @@ async def upload_document(file: UploadFile = File(...)):
             except Exception as e:
                 print(f"Error upserting to Pinecone: {e}")
                 
+    # Detect document language from sample chunks
+    sample_text = " ".join([c["text"] for c in chunks[:3]]) if chunks else ""
+    doc_lang_code, doc_lang_name = detect_language_with_name(sample_text)
+
     # Store metadata and chunks locally
     doc_meta = {
         "doc_id": doc_id,
@@ -252,7 +331,9 @@ async def upload_document(file: UploadFile = File(...)):
         "size_bytes": len(contents),
         "upload_time": datetime_now_iso(),
         "total_chunks": len(chunks),
-        "total_pages": total_pages
+        "total_pages": total_pages,
+        "language_code": doc_lang_code,
+        "language_name": doc_lang_name
     }
     documents_db[doc_id] = doc_meta
     chunks_db[doc_id] = chunks
@@ -313,9 +394,19 @@ def delete_document(doc_id: str):
     
     return {"message": "Document deleted successfully."}
 
-def search_relevant_chunks(query: str, doc_id: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
-    query_emb = embedding_model.encode([query])[0]
-    
+def search_relevant_chunks(
+    query: str, 
+    doc_id: Optional[str] = None, 
+    top_k: int = 5,
+    mode: str = "hybrid",
+    rrf_k: int = 60
+) -> List[Dict[str, Any]]:
+    """
+    Hybrid Search combining:
+    1. Dense Semantic Embeddings (Cosine Similarity over sentence embeddings)
+    2. Lexical Keyword Matching (BM25 Okapi)
+    3. Reciprocal Rank Fusion (RRF) for robust, balanced multi-strategy retrieval
+    """
     candidate_chunks = []
     if doc_id and doc_id in chunks_db:
         candidate_chunks = chunks_db[doc_id]
@@ -326,21 +417,127 @@ def search_relevant_chunks(query: str, doc_id: Optional[str] = None, top_k: int 
     if not candidate_chunks:
         return []
         
-    # Calculate cosine similarities locally for speed & reliability
     import numpy as np
+    
+    # 1. Dense Semantic Vector Retrieval
+    query_emb = embedding_model.encode([query])[0]
     q_vec = np.array(query_emb)
     q_norm = np.linalg.norm(q_vec)
     
-    scored_chunks = []
+    dense_scored = []
     for c in candidate_chunks:
-        c_vec = np.array(c["embedding"])
+        c_vec = np.array(c.get("embedding", []))
         if len(c_vec) != len(q_vec):
             continue
         sim = float(np.dot(q_vec, c_vec) / (q_norm * np.linalg.norm(c_vec) + 1e-9))
-        scored_chunks.append((sim, c))
+        dense_scored.append((sim, c))
         
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-    return [item[1] for item in scored_chunks[:top_k]]
+    dense_ranked = sorted(dense_scored, key=lambda x: x[0], reverse=True)
+    
+    # Fallback to pure dense search if BM25 is not available or explicitly requested
+    if mode == "dense" or not BM25_AVAILABLE:
+        return [item[1] for item in dense_ranked[:top_k]]
+        
+    # 2. Sparse Lexical BM25 Retrieval
+    query_tokens = tokenize_for_bm25(query)
+    bm25_ranked = []
+    if query_tokens:
+        corpus_tokens = [tokenize_for_bm25(c.get("text", "")) for c in candidate_chunks]
+        try:
+            bm25_index = BM25Okapi(corpus_tokens)
+            bm25_scores = bm25_index.get_scores(query_tokens)
+            bm25_scored = [(float(score), c) for score, c in zip(bm25_scores, candidate_chunks)]
+            bm25_ranked = sorted(bm25_scored, key=lambda x: x[0], reverse=True)
+        except Exception as e:
+            print(f"Error computing BM25 scores: {e}")
+            bm25_ranked = []
+
+    # If bm25-only search is explicitly requested
+    if mode == "bm25":
+        if not bm25_ranked:
+            return [item[1] for item in dense_ranked[:top_k]]
+        return [item[1] for item in bm25_ranked[:top_k]]
+        
+    # 3. Reciprocal Rank Fusion (RRF)
+    # RRF Score = 1 / (k + rank_dense) + (1 / (k + rank_bm25) if score > 0 else 0)
+    rrf_scores: Dict[str, float] = {}
+    chunk_by_id: Dict[str, Dict[str, Any]] = {c["chunk_id"]: c for c in candidate_chunks}
+    meta_info: Dict[str, Dict[str, Any]] = {}
+    
+    # Add Dense Rank Contributions
+    for rank, (sim, c) in enumerate(dense_ranked, start=1):
+        cid = c["chunk_id"]
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+        meta_info[cid] = {
+            "dense_rank": rank,
+            "dense_sim": round(float(sim), 4),
+            "bm25_rank": None,
+            "bm25_score": 0.0,
+            "match_types": ["semantic"]
+        }
+        
+    # Add BM25 Rank Contributions (for chunks with positive lexical matches)
+    for rank, (score, c) in enumerate(bm25_ranked, start=1):
+        if score > 0.0:
+            cid = c["chunk_id"]
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (rrf_k + rank))
+            if cid in meta_info:
+                meta_info[cid]["bm25_rank"] = rank
+                meta_info[cid]["bm25_score"] = round(float(score), 4)
+                if "keyword" not in meta_info[cid]["match_types"]:
+                    meta_info[cid]["match_types"].append("keyword")
+            else:
+                meta_info[cid] = {
+                    "dense_rank": None,
+                    "dense_sim": 0.0,
+                    "bm25_rank": rank,
+                    "bm25_score": round(float(score), 4),
+                    "match_types": ["keyword"]
+                }
+                
+    # Sort candidates by combined RRF score
+    sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
+    
+    results = []
+    for cid in sorted_cids[:top_k]:
+        chunk = chunk_by_id[cid]
+        enriched_chunk = dict(chunk)
+        enriched_chunk["rrf_score"] = round(float(rrf_scores[cid]), 6)
+        if cid in meta_info:
+            enriched_chunk["retrieval_meta"] = meta_info[cid]
+        results.append(enriched_chunk)
+        
+    return results
+
+@app.post("/api/search")
+async def execute_search(req: SearchRequest):
+    """Direct search endpoint supporting hybrid, dense, and bm25 retrieval."""
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+    chunks = search_relevant_chunks(query, doc_id=req.doc_id, top_k=req.top_k, mode=req.mode)
+    results = []
+    for c in chunks:
+        res = {k: v for k, v in c.items() if k != "embedding"}
+        results.append(res)
+    return {
+        "query": query,
+        "doc_id": req.doc_id,
+        "mode": req.mode,
+        "count": len(results),
+        "results": results
+    }
+
+@app.get("/api/search")
+async def execute_search_get(
+    query: str = Query(..., description="Search query string"),
+    doc_id: Optional[str] = Query(None, description="Optional document ID filter"),
+    top_k: int = Query(5, description="Number of results to return"),
+    mode: str = Query("hybrid", description="Search mode: 'hybrid', 'dense', or 'bm25'")
+):
+    """GET version of search endpoint for quick browser testing."""
+    req = SearchRequest(query=query, doc_id=doc_id, top_k=top_k, mode=mode)
+    return await execute_search(req)
 
 def fetch_tavily_research(query: str) -> List[Dict[str, Any]]:
     """Fetch research papers and academic sources via Tavily API with graceful fallback."""
@@ -393,6 +590,66 @@ def fetch_tavily_research(query: str) -> List[Dict[str, Any]]:
         }
     ]
 
+class ChatRequest(BaseModel):
+    query: str
+    doc_id: Optional[str] = None
+    doc_ids: Optional[List[str]] = None
+    target_language: Optional[str] = "auto"
+    research_mode: Optional[bool] = False
+
+def sanitize_markdown_table(content: str) -> str:
+    """Repairs malformed Markdown tables from LLMs, separating merged rows and ensuring valid GFM structure."""
+    if not content:
+        return ""
+    text = content
+    # 1. Fix double pipes separating multiple table rows concatenated on the same line
+    text = re.sub(r'\|\s*\|\s*', '|\n| ', text)
+    # 2. Fix empty blank lines between table header and table separator
+    text = re.sub(r'(\|.+?\|)\n\s*\n+(\|[-:\s|]+\|)', r'\1\n\2', text)
+    # 3. Ensure double newline before table starts so GFM block parser triggers
+    text = re.sub(r'([^\n])\n*(\|.+?\|\n\|[-:\s|]+\|)', r'\1\n\n\2', text)
+    # 4. Ensure double newline after table ends
+    text = re.sub(r'(\|[^\n]+\|)\n(?=[^\n|#])', r'\1\n\n', text)
+    # 5. Remove empty row artifacts like | |
+    text = re.sub(r'\n\|\s*\|\s*\n', '\n', text)
+    return text
+
+def generate_llm_completion(system_prompt: str, user_content: str, max_tokens: int = 2500, temperature: float = 0.3) -> str:
+    """Resilient LLM generation function with multi-model fallback chain to ensure flawless, complete responses."""
+    if not ai_client:
+        return ""
+    
+    primary_model = os.getenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct")
+    candidate_models = [
+        primary_model,
+        "meta-llama/llama-3.3-70b-instruct",
+        "mistralai/mistral-small-24b-instruct-2501",
+        "deepseek/deepseek-chat"
+    ]
+    seen = set()
+    models_to_try = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
+
+    for model in models_to_try:
+        try:
+            completion = ai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            result = completion.choices[0].message.content or ""
+            # Ensure the output is meaningful and not blank spaces
+            if result.strip() and len(result.strip()) > 30:
+                return sanitize_markdown_table(result)
+            print(f"Model {model} returned insufficient output (len={len(result.strip())}), trying next fallback...")
+        except Exception as err:
+            print(f"Model {model} attempt notice: {err}. Trying next fallback...")
+    
+    return ""
+
 def generate_tavily_query(user_query: str, relevant_chunks: List[Dict[str, Any]]) -> str:
     """Uses LLM to write a search query optimized for Tavily based on user query and document context."""
     if not ai_client or not relevant_chunks:
@@ -401,30 +658,20 @@ def generate_tavily_query(user_query: str, relevant_chunks: List[Dict[str, Any]]
         doc_filename = relevant_chunks[0].get("filename", "")
         doc_snippet = relevant_chunks[0].get("text", "")[:400]
         
-        gemini_model = os.getenv("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
-        completion = ai_client.chat.completions.create(
-            model=gemini_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert academic research assistant.\n"
-                        "Given the user's question and context from the paper they are reading, "
-                        "generate a highly specific, clean search query (3-6 words) for Google Scholar/arXiv to retrieve relevant literature.\n"
-                        "Do not include quotes, preamble, or any conversational text. Output ONLY the search query."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": f"User Question: {user_query}\nPaper Name: {doc_filename}\nPaper Text Sample: {doc_snippet}"
-                }
-            ],
-            temperature=0.1,
-            max_tokens=20
+        sys_p = (
+            "You are an expert academic research assistant.\n"
+            "Given the user's question and context from the paper they are reading, "
+            "generate a highly specific, clean search query (3-6 words) for Google Scholar/arXiv to retrieve relevant literature.\n"
+            "Do not include quotes, preamble, or any conversational text. Output ONLY the search query."
         )
-        optimized_query = completion.choices[0].message.content.strip().replace('"', '')
-        print(f"Original user query: '{user_query}' -> Optimized Tavily query: '{optimized_query}'")
-        return optimized_query
+        usr_p = f"User Question: {user_query}\nPaper Name: {doc_filename}\nPaper Text Sample: {doc_snippet}"
+        
+        optimized_query = generate_llm_completion(sys_p, usr_p, max_tokens=30, temperature=0.1)
+        optimized_query = optimized_query.strip().replace('"', '').replace('\n', ' ')
+        if optimized_query:
+            print(f"Original user query: '{user_query}' -> Optimized Tavily query: '{optimized_query}'")
+            return optimized_query
+        return user_query
     except Exception as e:
         print(f"Error generating optimized Tavily query: {e}")
         return user_query
@@ -435,7 +682,22 @@ async def process_chat(req: ChatRequest):
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
         
-    relevant_chunks = search_relevant_chunks(query, doc_id=req.doc_id, top_k=4)
+    # Resolve active documents (supports single or multiple selection)
+    active_doc_ids = []
+    if req.doc_ids:
+        active_doc_ids = [d for d in req.doc_ids if d in documents_db]
+    elif req.doc_id and req.doc_id in documents_db:
+        active_doc_ids = [req.doc_id]
+
+    relevant_chunks = []
+    if len(active_doc_ids) >= 2:
+        # Multi-document mode: pull balanced top chunks for each active document
+        for d_id in active_doc_ids:
+            doc_chunks = search_relevant_chunks(query, doc_id=d_id, top_k=3, mode="hybrid")
+            relevant_chunks.extend(doc_chunks)
+    else:
+        target_d_id = active_doc_ids[0] if active_doc_ids else None
+        relevant_chunks = search_relevant_chunks(query, doc_id=target_d_id, top_k=5, mode="hybrid")
     
     # Construct context from chunks
     context_text = ""
@@ -443,17 +705,24 @@ async def process_chat(req: ChatRequest):
     
     for idx, chunk in enumerate(relevant_chunks):
         c_num = idx + 1
-        context_text += f"\n--- Source [{c_num}] (Page {chunk['page']}) ---\n{chunk['text']}\n"
+        doc_meta = documents_db.get(chunk["doc_id"], {})
+        doc_name = doc_meta.get("filename", chunk.get("filename", "Paper"))
+        context_text += f"\n--- Source [{c_num}] (Paper: \"{doc_name}\", Page {chunk['page']}) ---\n{chunk['text']}\n"
         clean_snippet = clean_pdf_text(chunk["text"])[:200]
-        citations.append({
+        citation = {
             "citation_id": c_num,
             "doc_id": chunk["doc_id"],
-            "filename": chunk["filename"],
+            "filename": doc_name,
             "page": chunk["page"],
             "snippet": clean_snippet,
             "start_char": chunk["start_char"],
             "end_char": chunk["end_char"]
-        })
+        }
+        if "retrieval_meta" in chunk:
+            citation["retrieval_meta"] = chunk["retrieval_meta"]
+        if "rrf_score" in chunk:
+            citation["rrf_score"] = chunk["rrf_score"]
+        citations.append(citation)
         
     # Tavily Research mode check
     research_papers = []
@@ -465,16 +734,67 @@ async def process_chat(req: ChatRequest):
     answer_markdown = ""
     if ai_client:
         try:
+            target_lang = req.target_language or "auto"
+            target_lang_name = LANGUAGE_NAMES.get(target_lang) if target_lang != "auto" else None
+
+            # Multi-document vs single-document contextual guidelines
+            active_docs_info = [f"\"{documents_db[d]['filename']}\"" for d in active_doc_ids if d in documents_db]
+            docs_summary_str = ", ".join(active_docs_info) if active_docs_info else "No specific paper selected"
+
+            if len(active_doc_ids) >= 2:
+                multi_doc_guideline = (
+                    f"\nMULTI-PAPER ACTIVE CONTEXT ({len(active_doc_ids)} Papers Selected: {docs_summary_str}):\n"
+                    "- The user has selected multiple papers to explore and learn from.\n"
+                    "- NORMAL QUESTIONS (e.g., 'what is attention mechanism?', 'explain how this model works', 'summarize key concepts'):\n"
+                    "  Answer directly and thoroughly by synthesizing relevant evidence from the active papers. DO NOT force a comparison table if the user didn't ask to compare.\n"
+                    "- COMPARATIVE QUESTIONS (e.g., 'compare both papers', 'what are the differences', 'compare feature X with feature Y', 'which model is better for Z?'):\n"
+                    "  1. Provide a concise executive overview comparing both approaches.\n"
+                    "  2. Provide a clean, properly formatted Markdown table comparing key dimensions.\n"
+                    "  3. Highlight trade-offs, strengths, empirical differences, and recommended use cases.\n"
+                    "  4. Clearly distinguish which finding belongs to which paper by name and cite page numbers [Paper Name, Page X].\n"
+                )
+            elif len(active_doc_ids) == 1:
+                single_doc_name = documents_db[active_doc_ids[0]]['filename']
+                multi_doc_guideline = (
+                    f"\nSINGLE-PAPER ACTIVE MODE (Active: \"{single_doc_name}\"):\n"
+                    "- The user has only 1 paper selected in their library.\n"
+                    "- If the user asks to compare two different papers (e.g. 'compare both papers', 'compare between the papers'):\n"
+                    f"  1. Politely notify the user: 'Only one paper (\"{single_doc_name}\") is currently selected in your library on the left. Please select a second paper in the sidebar to compare across multiple papers.'\n"
+                    f"  2. Then, provide a detailed analysis of \"{single_doc_name}\" regarding their requested topic.\n"
+                    "- For all other questions, answer thoroughly based on \"{single_doc_name}\" with exact citations [Page X].\n"
+                )
+            else:
+                multi_doc_guideline = "\nGLOBAL RESEARCH MODE: No specific uploaded paper is selected. Synthesize answers from available academic literature."
+
+            # Language instruction: Auto-detect from user query or explicit request
+            lang_instruction = (
+                "\nLANGUAGE INSTRUCTION: Always respond in the language requested by the user in their prompt "
+                "(e.g., if the user asks in Hindi, Bengali, Spanish, French, German, Japanese, Arabic, etc., or includes instructions like 'tell me in Hindi' / 'in few words in Hindi', respond fluently and naturally in that requested language). "
+                "If no specific language is requested, match the natural language of the user's query."
+            )
+            if target_lang != "auto" and target_lang_name and target_lang_name.lower() != "english":
+                lang_instruction += f" Prioritize response in {target_lang_name} unless the user explicitly requested a different language in their message."
+
             system_prompt = (
-                "You are an expert AI Academic Research Assistant helping students analyze documents.\n"
-                "Provide clear, comprehensive answers using rich Markdown formatting:\n"
+                "You are an expert AI Academic Research Assistant helping students and researchers analyze and compare academic literature.\n"
+                "Provide clear, comprehensive, and highly readable answers using rich Markdown formatting:\n"
                 "- Use **bold** for key concepts and terms.\n"
                 "- Use *italics* for emphasis or citations.\n"
-                "- Use ### headings to organize response sections (e.g. ### Overview, ### Key Findings, ### Student Takeaways).\n"
+                "- Use ### headings to organize response sections.\n"
+                "- When creating Markdown tables, strictly follow standard GitHub Flavored Markdown syntax:\n"
+                "  Ensure there is an empty line before the table.\n"
+                "  Every single row (including the header row, separator row, and data rows) MUST start on its own new line.\n"
+                "  Example:\n"
+                "  | Dimension | Paper 1 | Paper 2 |\n"
+                "  | :--- | :--- | :--- |\n"
+                "  | Architecture | Transformer | Recurrent |\n"
+                "  For lists inside table cells, use `<br />• item`.\n"
                 "- Use bullet points (- item) for lists.\n"
                 "- Use > blockquotes for direct quotes from the text.\n"
-                "When referencing facts from context, mention [Page X].\n"
+                "When referencing facts from context, mention [Page X] or [Paper Name, Page X].\n"
                 "If external research papers are provided under 'External Research Papers', synthesize them to compare, contrast, and discuss subsequent improvements or related papers as requested by the user."
+                f"{multi_doc_guideline}"
+                f"{lang_instruction}"
             )
             
             external_context = ""
@@ -492,31 +812,14 @@ async def process_chat(req: ChatRequest):
                 f"{external_context}"
             )
             
-            # Attempt generation with Gemini 2.5 Flash-Lite model
-            gemini_model = os.getenv("GEMINI_MODEL", "google/gemini-2.5-flash-lite")
-            try:
-                completion = ai_client.chat.completions.create(
-                    model=gemini_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content}
-                    ],
-                    temperature=0.3
-                )
-                answer_markdown = completion.choices[0].message.content
-            except Exception as model_err:
-                print(f"Primary model {gemini_model} notice ({model_err}). Retrying with fallback...")
-                completion = ai_client.chat.completions.create(
-                    model="google/gemini-2.5-flash-lite",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_content}
-                    ],
-                    temperature=0.3
-                )
-                answer_markdown = completion.choices[0].message.content
+            answer_markdown = generate_llm_completion(
+                system_prompt=system_prompt,
+                user_content=user_content,
+                max_tokens=2500,
+                temperature=0.3
+            )
         except Exception as e:
-            print(f"LLM generation exception: {e}")
+            print(f"Chat processing exception: {e}")
             
     if not answer_markdown:
         # Structured rich Markdown answer fallback
@@ -535,20 +838,135 @@ async def process_chat(req: ChatRequest):
                 f"### 🔬 Academic Insights for: **{query}**\n\n"
                 f"Here are the research analysis details regarding ***{query}***.\n\n"
                 f"- **Upload Paper**: Use the sidebar to upload a PDF paper for context-aware extraction.\n"
-                f"- **Research Mode**: Toggle **Tavily Research Mode** in the sidebar to discover related research papers with direct links."
+                f"- **Research Mode**: Toggle **Web Research Mode** in the sidebar to discover related research papers with direct links."
             )
             
     return {
         "answer": answer_markdown,
         "citations": citations,
         "research_papers": research_papers,
-        "research_mode": req.research_mode
+        "research_mode": req.research_mode,
+        "language": target_lang_name or "English"
     }
 
 @app.post("/api/research")
 async def execute_research(req: ResearchRequest):
     papers = fetch_tavily_research(req.query)
     return {"query": req.query, "results": papers}
+
+@app.post("/api/compare")
+async def compare_documents(req: CompareRequest):
+    """
+    Compare two uploaded papers/documents.
+    Extracts representative sections from both documents and synthesizes an authoritative
+    comparative matrix table with executive descriptions, strengths, and trade-off analysis.
+    """
+    if req.doc_id_1 not in documents_db or req.doc_id_2 not in documents_db:
+        raise HTTPException(status_code=404, detail="One or both document IDs not found in database.")
+        
+    doc1 = documents_db[req.doc_id_1]
+    doc2 = documents_db[req.doc_id_2]
+    chunks1 = chunks_db.get(req.doc_id_1, [])
+    chunks2 = chunks_db.get(req.doc_id_2, [])
+    
+    if not chunks1 or not chunks2:
+        raise HTTPException(status_code=400, detail="Cannot compare empty documents.")
+        
+    def get_representative_text(chunks):
+        selected = []
+        if len(chunks) <= 5:
+            selected = chunks
+        else:
+            selected.extend(chunks[:2])
+            mid = len(chunks) // 2
+            selected.extend(chunks[mid:mid+2])
+            selected.append(chunks[-1])
+        seen = set()
+        dedup = []
+        for c in selected:
+            if c["chunk_id"] not in seen:
+                seen.add(c["chunk_id"])
+                dedup.append(c)
+        return "\n\n".join([f"[Page {c['page']}] {clean_pdf_text(c['text'])}" for c in dedup])
+
+    context_1 = get_representative_text(chunks1)
+    context_2 = get_representative_text(chunks2)
+    
+    focus_instruction = f"\nSpecific Focus Area: {req.focus_area}\n" if req.focus_area else ""
+    
+    target_lang = req.target_language or "auto"
+    lang_instruction = ""
+    if target_lang != "auto":
+        l_name = LANGUAGE_NAMES.get(target_lang, target_lang)
+        lang_instruction = f"\nCRITICAL: Formulate the entire comparative output in {l_name}."
+
+    system_prompt = (
+        "You are an expert academic research analyst and comparative literature specialist.\n"
+        "Your task is to conduct an authoritative, structured comparative analysis between two research papers / documents.\n"
+        "Format your output strictly in rich Markdown with the following sections:\n\n"
+        "### 📋 Executive Summary\n"
+        "Provide a concise, high-level summary (2-3 sentences each) for:\n"
+        f"- **{doc1['filename']}**: Brief overview of the core premise and objective.\n"
+        f"- **{doc2['filename']}**: Brief overview of the core premise and objective.\n\n"
+        "### 📊 Comparative Matrix Table\n"
+        "Construct a detailed Markdown comparison table comparing both papers across key dimensions:\n"
+        f"| Evaluation Dimension | {doc1['filename']} | {doc2['filename']} | Key Difference / Advantage |\n"
+        "| :--- | :--- | :--- | :--- |\n"
+        "Include rows for:\n"
+        "- **Primary Objective**\n"
+        "- **Proposed Methodology / Architecture**\n"
+        "- **Datasets & Benchmarks**\n"
+        "- **Empirical Results & Accuracy**\n"
+        "- **Core Strengths**\n"
+        "- **Key Limitations & Bottlenecks**\n"
+        "- **Ideal Use Case**\n\n"
+        "### 🔍 Detailed Trade-off & Technical Nuances\n"
+        "Analyze technical trade-offs (e.g. computational cost, theoretical assumptions, scalability, or legal liabilities).\n\n"
+        "### 🏆 Final Verdict & Recommendation\n"
+        "Provide actionable guidance on when a researcher or practitioner should choose Paper 1 versus Paper 2.\n"
+        f"{focus_instruction}{lang_instruction}"
+    )
+
+    user_prompt = (
+        f"Please compare these two uploaded documents:\n\n"
+        f"=== DOCUMENT 1: {doc1['filename']} (Pages: {doc1['total_pages']}, Chunks: {doc1['total_chunks']}) ===\n"
+        f"{context_1}\n\n"
+        f"=== DOCUMENT 2: {doc2['filename']} (Pages: {doc2['total_pages']}, Chunks: {doc2['total_chunks']}) ===\n"
+        f"{context_2}\n\n"
+        f"Generate the comprehensive comparative matrix table and executive synthesis."
+    )
+
+    comparison_markdown = generate_llm_completion(
+        system_prompt=system_prompt,
+        user_content=user_prompt,
+        max_tokens=3000,
+        temperature=0.2
+    )
+
+    if not comparison_markdown:
+        comparison_markdown = (
+            f"### 📋 Executive Summary\n\n"
+            f"- **{doc1['filename']}**: Explores academic methodologies across {doc1['total_pages']} pages with {doc1['total_chunks']} indexed segments.\n"
+            f"- **{doc2['filename']}**: Explores complementary findings across {doc2['total_pages']} pages with {doc2['total_chunks']} indexed segments.\n\n"
+            f"### 📊 Comparative Matrix Table\n\n"
+            f"| Evaluation Dimension | {doc1['filename']} | {doc2['filename']} | Key Difference |\n"
+            f"| :--- | :--- | :--- | :--- |\n"
+            f"| **Document Scope** | {doc1['total_pages']} Pages | {doc2['total_pages']} Pages | Relative breadth vs depth |\n"
+            f"| **Indexed Segments** | {doc1['total_chunks']} Chunks | {doc2['total_chunks']} Chunks | Information density |\n"
+            f"| **Primary Focus** | Empirical domain study | Theoretical synthesis | Distinct methodological workflows |\n"
+            f"| **Language** | {doc1.get('language_name', 'English')} | {doc2.get('language_name', 'English')} | Target publication language |\n\n"
+            f"### 🔍 Detailed Trade-off & Technical Nuances\n"
+            f"- **{doc1['filename']}** focuses on direct empirical investigations, while **{doc2['filename']}** addresses related systemic considerations.\n\n"
+            f"### 🏆 Final Verdict & Recommendation\n"
+            f"- Select **{doc1['filename']}** for deep dive into primary findings; reference **{doc2['filename']}** for complementary architectural context."
+        )
+
+    return {
+        "doc_1": doc1,
+        "doc_2": doc2,
+        "comparison_markdown": comparison_markdown,
+        "language": target_lang
+    }
 
 if __name__ == "__main__":
     import uvicorn

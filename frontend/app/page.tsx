@@ -19,6 +19,7 @@ import {
   Share2,
   Sparkles,
   Globe,
+  Bell,
   Cpu as CpuIcon
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';

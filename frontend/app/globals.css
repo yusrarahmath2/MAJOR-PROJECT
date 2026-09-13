@@ -79,23 +79,26 @@
   background: radial-gradient(circle at 50% 0%, rgba(99, 102, 241, 0.18), transparent 70%);
 }
 
-/* Custom scrollbar styling */
+/* Completely hide scrollbars while maintaining full scrollability */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  display: none;
+  width: 0px;
+  height: 0px;
+  background: transparent;
 }
 
-::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.5);
+* {
+  -ms-overflow-style: none; /* IE and Edge */
+  scrollbar-width: none; /* Firefox */
 }
 
-::-webkit-scrollbar-thumb {
-  background: rgba(99, 102, 241, 0.3);
-  border-radius: 4px;
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(99, 102, 241, 0.6);
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 
 /* Markdown typography styling */
@@ -177,6 +180,52 @@
   border-radius: 0 0.5rem 0.5rem 0 !important;
   padding-top: 0.5rem !important;
   padding-bottom: 0.5rem !important;
+}
+
+/* Markdown table styling */
+.markdown-content table {
+  width: 100% !important;
+  border-collapse: collapse !important;
+  margin: 1.25rem 0 !important;
+  font-size: 0.85rem !important;
+  border-radius: 0.75rem !important;
+  overflow: hidden !important;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05) !important;
+  border: 1px solid #e2e8f0 !important;
+}
+
+.markdown-content th {
+  background-color: #f8fafc !important;
+  color: #1e293b !important;
+  font-weight: 700 !important;
+  text-align: left !important;
+  padding: 0.75rem 1rem !important;
+  border-bottom: 2px solid #e2e8f0 !important;
+  border-right: 1px solid #e2e8f0 !important;
+}
+
+.markdown-content th:last-child {
+  border-right: none !important;
+}
+
+.markdown-content td {
+  padding: 0.75rem 1rem !important;
+  border-bottom: 1px solid #f1f5f9 !important;
+  border-right: 1px solid #f1f5f9 !important;
+  color: #334155 !important;
+  vertical-align: top !important;
+}
+
+.markdown-content td:last-child {
+  border-right: none !important;
+}
+
+.markdown-content tr:nth-child(even) {
+  background-color: #fbfcfe !important;
+}
+
+.markdown-content tr:hover {
+  background-color: #f1f5f9 !important;
 }
 
 .saas-gradient-bg {
